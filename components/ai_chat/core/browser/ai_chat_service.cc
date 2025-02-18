@@ -153,6 +153,79 @@ void AIChatService::Shutdown() {
   }
 }
 
+void AIChatService::OnRequestInProgressChanged(ConversationHandler* handler,
+    bool in_progress) {
+    // We don't unload a conversation if it has a request in progress, so check
+    // again when that changes.
+    if (!in_progress) {
+        MaybeUnloadConversation(handler);
+    }
+}
+
+void AIChatService::OnConversationEntryAdded(
+    ConversationHandler* handler,
+    mojom::ConversationTurnPtr& entry,
+    std::optional<std::string_view> associated_content_value) {
+    auto conversation_it = conversations_.find(handler->get_conversation_uuid());
+    CHECK(conversation_it != conversations_.end());
+    mojom::ConversationPtr& conversation = conversation_it->second;
+
+    if (!conversation->has_content) {
+        HandleFirstEntry(handler, entry, associated_content_value, conversation);
+    }
+    else {
+        HandleNewEntry(handler, entry, associated_content_value, conversation);
+    }
+
+    conversation->has_content = true;
+    conversation->updated_time = entry->created_time;
+    OnConversationListChanged();
+}
+
+void AIChatService::OnConversationEntryRemoved(ConversationHandler* handler,
+    std::string entry_uuid) {
+    // Persist the removal
+    if (ai_chat_db_) {
+        ai_chat_db_
+            .AsyncCall(base::IgnoreResult(&AIChatDatabase::DeleteConversationEntry))
+            .WithArgs(entry_uuid);
+    }
+}
+
+void AIChatService::OnClientConnectionChanged(ConversationHandler* handler) {
+    DVLOG(4) << "Client connection changed for conversation "
+        << handler->get_conversation_uuid();
+    MaybeUnloadConversation(handler);
+}
+
+void AIChatService::OnConversationTitleChanged(
+    const std::string& conversation_uuid,
+    const std::string& new_title) {
+    auto conversation_it = conversations_.find(conversation_uuid);
+    if (conversation_it == conversations_.end()) {
+        DLOG(ERROR) << "Conversation not found for title change";
+        return;
+    }
+
+    auto& conversation_metadata = conversation_it->second;
+    conversation_metadata->title = new_title;
+
+    OnConversationListChanged();
+
+    // Persist the change
+    if (ai_chat_db_) {
+        ai_chat_db_
+            .AsyncCall(base::IgnoreResult(&AIChatDatabase::UpdateConversationTitle))
+            .WithArgs(conversation_uuid, new_title);
+    }
+}
+
+void AIChatService::OnAssociatedContentDestroyed(ConversationHandler* handler,
+    int content_id) {
+    content_conversations_.erase(content_id);
+    MaybeUnloadConversation(handler);
+}
+
 ConversationHandler* AIChatService::CreateConversation() {
   base::Uuid uuid = base::Uuid::GenerateRandomV4();
   std::string conversation_uuid = uuid.AsLowercaseString();
@@ -237,121 +310,260 @@ void AIChatService::GetConversation(
       std::move(callback)));
 }
 
-void AIChatService::OnConversationDataReceived(
-    std::string conversation_uuid,
-    base::OnceCallback<void(ConversationHandler*)> callback,
-    mojom::ConversationArchivePtr data) {
-  DVLOG(4) << __func__ << " for " << conversation_uuid
-           << " with data: " << data->entries.size() << " entries and "
-           << data->associated_content.size() << " contents";
-  auto conversation_it = conversations_.find(conversation_uuid);
-  if (conversation_it == conversations_.end()) {
-    std::move(callback).Run(nullptr);
-    return;
-  }
-  mojom::Conversation* conversation = conversation_it->second.get();
-  std::unique_ptr<ConversationHandler> conversation_handler =
-      std::make_unique<ConversationHandler>(
-          conversation, this, model_service_, credential_manager_.get(),
-          feedback_api_.get(), url_loader_factory_, std::move(data));
-  conversation_observations_.AddObservation(conversation_handler.get());
-  conversation_handlers_.insert_or_assign(conversation_uuid,
-                                          std::move(conversation_handler));
-  std::move(callback).Run(GetConversation(conversation_uuid));
-}
-
 ConversationHandler* AIChatService::GetOrCreateConversationHandlerForContent(
     int associated_content_id,
     base::WeakPtr<ConversationHandler::AssociatedContentDelegate>
-        associated_content) {
-  ConversationHandler* conversation = nullptr;
-  auto conversation_uuid_it =
-      content_conversations_.find(associated_content_id);
-  if (conversation_uuid_it != content_conversations_.end()) {
-    auto conversation_uuid = conversation_uuid_it->second;
-    // Load from memory or database, but probably not database as if the
-    // conversation is in the associated content map then it's probably recent
-    // and still in memory.
-    conversation = GetConversation(conversation_uuid);
-  }
-  if (!conversation) {
-    // New conversation needed
-    conversation = CreateConversation();
-  }
-  // Provide the content delegate, if allowed
-  MaybeAssociateContentWithConversation(conversation, associated_content_id,
-                                        associated_content);
+    associated_content) {
+    ConversationHandler* conversation = nullptr;
+    auto conversation_uuid_it =
+        content_conversations_.find(associated_content_id);
+    if (conversation_uuid_it != content_conversations_.end()) {
+        auto conversation_uuid = conversation_uuid_it->second;
+        // Load from memory or database, but probably not database as if the
+        // conversation is in the associated content map then it's probably recent
+        // and still in memory.
+        conversation = GetConversation(conversation_uuid);
+    }
+    if (!conversation) {
+        // New conversation needed
+        conversation = CreateConversation();
+    }
+    // Provide the content delegate, if allowed
+    MaybeAssociateContentWithConversation(conversation, associated_content_id,
+        associated_content);
 
-  return conversation;
+    return conversation;
 }
 
 ConversationHandler* AIChatService::CreateConversationHandlerForContent(
     int associated_content_id,
     base::WeakPtr<ConversationHandler::AssociatedContentDelegate>
-        associated_content) {
-  ConversationHandler* conversation = CreateConversation();
-  // Provide the content delegate, if allowed
-  MaybeAssociateContentWithConversation(conversation, associated_content_id,
-                                        associated_content);
+    associated_content) {
+    ConversationHandler* conversation = CreateConversation();
+    // Provide the content delegate, if allowed
+    MaybeAssociateContentWithConversation(conversation, associated_content_id,
+        associated_content);
 
-  return conversation;
+    return conversation;
 }
 
 void AIChatService::DeleteConversations(std::optional<base::Time> begin_time,
-                                        std::optional<base::Time> end_time) {
-  if (!begin_time.has_value() && !end_time.has_value()) {
-    // Delete all conversations
-    // Delete in-memory data
-    conversation_observations_.RemoveAllObservations();
-    conversation_handlers_.clear();
-    conversations_.clear();
-    content_conversations_.clear();
+    std::optional<base::Time> end_time) {
+    if (!begin_time.has_value() && !end_time.has_value()) {
+        // Delete all conversations
+        // Delete in-memory data
+        conversation_observations_.RemoveAllObservations();
+        conversation_handlers_.clear();
+        conversations_.clear();
+        content_conversations_.clear();
 
-    // Delete database data
-    if (ai_chat_db_) {
-      ai_chat_db_.AsyncCall(base::IgnoreResult(&AIChatDatabase::DeleteAllData));
-      ReloadConversations();
+        // Delete database data
+        if (ai_chat_db_) {
+            ai_chat_db_.AsyncCall(base::IgnoreResult(&AIChatDatabase::DeleteAllData));
+            ReloadConversations();
+        }
+        if (ai_chat_metrics_ != nullptr) {
+            ai_chat_metrics_->RecordReset();
+        }
+        OnConversationListChanged();
+        return;
     }
-    if (ai_chat_metrics_ != nullptr) {
-      ai_chat_metrics_->RecordReset();
+
+    // Get all keys from conversations_
+    std::vector<std::string> conversation_keys;
+
+    for (auto& [uuid, conversation] : conversations_) {
+        if (IsConversationUpdatedTimeWithinRange(begin_time, end_time,
+            conversation)) {
+            conversation_keys.push_back(uuid);
+        }
     }
-    OnConversationListChanged();
-    return;
-  }
 
-  // Get all keys from conversations_
-  std::vector<std::string> conversation_keys;
-
-  for (auto& [uuid, conversation] : conversations_) {
-    if (IsConversationUpdatedTimeWithinRange(begin_time, end_time,
-                                             conversation)) {
-      conversation_keys.push_back(uuid);
+    for (const auto& uuid : conversation_keys) {
+        DeleteConversation(uuid);
     }
-  }
-
-  for (const auto& uuid : conversation_keys) {
-    DeleteConversation(uuid);
-  }
-  if (!conversation_keys.empty()) {
-    OnConversationListChanged();
-  }
+    if (!conversation_keys.empty()) {
+        OnConversationListChanged();
+    }
 }
 
 void AIChatService::DeleteAssociatedWebContent(
     std::optional<base::Time> begin_time,
     std::optional<base::Time> end_time,
     base::OnceCallback<void(bool)> callback) {
-  if (!ai_chat_db_) {
-    std::move(callback).Run(true);
-    return;
-  }
+    if (!ai_chat_db_) {
+        std::move(callback).Run(true);
+        return;
+    }
 
-  ai_chat_db_.AsyncCall(&AIChatDatabase::DeleteAssociatedWebContent)
-      .WithArgs(begin_time, end_time)
-      .Then(std::move(callback));
+    ai_chat_db_.AsyncCall(&AIChatDatabase::DeleteAssociatedWebContent)
+        .WithArgs(begin_time, end_time)
+        .Then(std::move(callback));
 
-  // Update local data
-  ReloadConversations();
+    // Update local data
+    ReloadConversations();
+}
+
+void AIChatService::OpenConversationWithStagedEntries(
+    base::WeakPtr<ConversationHandler::AssociatedContentDelegate>
+    associated_content,
+    base::OnceClosure open_ai_chat) {
+    if (!associated_content || !associated_content->HasOpenAIChatPermission()) {
+        return;
+    }
+
+    ConversationHandler* conversation = GetOrCreateConversationHandlerForContent(
+        associated_content->GetContentId(), associated_content);
+    CHECK(conversation);
+
+#if !BUILDFLAG(IS_ANDROID) && !BUILDFLAG(IS_IOS)
+    if (ai_chat_metrics_ != nullptr) {
+        ai_chat_metrics_->HandleOpenViaEntryPoint(EntryPoint::kBraveSearch);
+    }
+#endif
+    // Open AI Chat and trigger a fetch of staged conversations from Brave Search.
+    std::move(open_ai_chat).Run();
+    conversation->MaybeFetchOrClearContentStagedConversation();
+}
+
+void AIChatService::AssociateContent(
+    ConversationHandler::AssociatedContentDelegate* content,
+    const std::string& conversation_uuid) {
+    CHECK(content);
+
+    // Note: As we're using the non-async version of GetConversation, this will
+    // only work when the conversation is already loaded.
+    // If we ever need to associate content with a conversation that is not
+    // loaded, we'll need to use the async version of GetConversation.
+    auto* conversation = GetConversation(conversation_uuid);
+    if (!conversation) {
+        return;
+    }
+
+    MaybeAssociateContentWithConversation(conversation, content->GetContentId(),
+        content->GetWeakPtr());
+}
+
+void AIChatService::MarkAgreementAccepted() {
+    SetUserOptedIn(profile_prefs_, true);
+}
+
+void AIChatService::EnableStoragePref() {
+    profile_prefs_->SetBoolean(prefs::kBraveChatStorageEnabled, true);
+}
+
+void AIChatService::DismissStorageNotice() {
+    profile_prefs_->SetBoolean(prefs::kUserDismissedStorageNotice, true);
+}
+
+void AIChatService::DismissPremiumPrompt() {
+    profile_prefs_->SetBoolean(prefs::kUserDismissedPremiumPrompt, true);
+}
+
+void AIChatService::GetVisibleConversations(
+    GetVisibleConversationsCallback callback) {
+    LoadConversationsLazy(base::BindOnce(
+        [](GetVisibleConversationsCallback callback,
+            ConversationMap& conversations_map) {
+                std::vector<mojom::ConversationPtr> conversations;
+                for (const auto& conversation :
+                    FilterVisibleConversations(conversations_map)) {
+                    conversations.push_back(conversation->Clone());
+                }
+                std::move(callback).Run(std::move(conversations));
+        },
+        std::move(callback)));
+}
+
+void AIChatService::GetActionMenuList(GetActionMenuListCallback callback) {
+    std::move(callback).Run(ai_chat::GetActionMenuList());
+}
+
+void AIChatService::GetPremiumStatus(GetPremiumStatusCallback callback) {
+    credential_manager_->GetPremiumStatus(
+        base::BindOnce(&AIChatService::OnPremiumStatusReceived,
+            weak_ptr_factory_.GetWeakPtr(), std::move(callback)));
+}
+
+void AIChatService::DeleteConversation(const std::string& id) {
+    auto handler_it = conversation_handlers_.find(id);
+    if (handler_it != conversation_handlers_.end()) {
+        conversation_observations_.RemoveObservation(handler_it->second.get());
+        conversation_handlers_.erase(id);
+    }
+    conversations_.erase(id);
+    DVLOG(1) << "Erased conversation due to deletion request (" << id
+        << "). Now have " << conversations_.size()
+        << " Conversation metadata items and "
+        << conversation_handlers_.size()
+        << " ConversationHandler instances.";
+    OnConversationListChanged();
+    // Update database
+    if (ai_chat_db_) {
+        ai_chat_db_
+            .AsyncCall(base::IgnoreResult(&AIChatDatabase::DeleteConversation))
+            .WithArgs(id);
+    }
+}
+
+void AIChatService::RenameConversation(const std::string& id,
+    const std::string& new_name) {
+    OnConversationTitleChanged(id, new_name);
+}
+
+void AIChatService::ConversationExists(const std::string& conversation_uuid,
+    ConversationExistsCallback callback) {
+    std::move(callback).Run(conversations_.contains(conversation_uuid));
+}
+
+void AIChatService::BindConversation(
+    const std::string& uuid,
+    mojo::PendingReceiver<mojom::ConversationHandler> receiver,
+    mojo::PendingRemote<mojom::ConversationUI> conversation_ui_handler) {
+    GetConversation(
+        std::move(uuid),
+        base::BindOnce(
+            [](mojo::PendingReceiver<mojom::ConversationHandler> receiver,
+                mojo::PendingRemote<mojom::ConversationUI> conversation_ui_handler,
+                ConversationHandler* handler) {
+                    if (!handler) {
+                        DVLOG(0) << "Failed to get conversation for binding";
+                        return;
+                    }
+                    handler->Bind(std::move(receiver),
+                        std::move(conversation_ui_handler));
+            },
+            std::move(receiver), std::move(conversation_ui_handler)));
+}
+
+void AIChatService::BindObserver(
+    mojo::PendingRemote<mojom::ServiceObserver> observer,
+    BindObserverCallback callback) {
+    observer_remotes_.Add(std::move(observer));
+    std::move(callback).Run(BuildState());
+}
+
+bool AIChatService::HasUserOptedIn() {
+    return ai_chat::HasUserOptedIn(profile_prefs_);
+}
+
+bool AIChatService::IsPremiumStatus() {
+    return ai_chat::IsPremiumStatus(last_premium_status_);
+}
+
+bool AIChatService::IsAIChatHistoryEnabled() {
+    return (features::IsAIChatHistoryEnabled() &&
+        profile_prefs_->GetBoolean(prefs::kBraveChatStorageEnabled));
+}
+
+std::unique_ptr<EngineConsumer> AIChatService::GetDefaultAIEngine() {
+    return model_service_->GetEngineForModel(model_service_->GetDefaultModelKey(),
+        url_loader_factory_,
+        credential_manager_.get());
+}
+
+size_t AIChatService::GetInMemoryConversationCountForTesting() {
+    return conversation_handlers_.size();
 }
 
 void AIChatService::MaybeInitStorage() {
@@ -396,6 +608,297 @@ void AIChatService::OnOsCryptAsyncReady(os_crypt_async::Encryptor encryptor,
       profile_path_.Append(kDBFileName), std::move(encryptor));
 }
 
+void AIChatService::LoadConversationsLazy(ConversationMapCallback callback) {
+    // Send immediately if we have finished loading from storage
+    if (!ai_chat_db_ || (on_conversations_loaded_callbacks_.has_value() &&
+        on_conversations_loaded_callbacks_->empty())) {
+        std::move(callback).Run(conversations_);
+        return;
+    }
+    if (on_conversations_loaded_callbacks_.has_value()) {
+        on_conversations_loaded_callbacks_->push_back(std::move(callback));
+        return;
+    }
+
+    on_conversations_loaded_callbacks_ = std::vector<ConversationMapCallback>();
+    on_conversations_loaded_callbacks_->push_back(std::move(callback));
+    ai_chat_db_.AsyncCall(&AIChatDatabase::GetAllConversations)
+        .Then(base::BindOnce(&AIChatService::OnLoadConversationsLazyData,
+            weak_ptr_factory_.GetWeakPtr()));
+}
+
+void AIChatService::OnLoadConversationsLazyData(
+    std::vector<mojom::ConversationPtr> conversations) {
+    if (!cancel_conversation_load_callback_.is_null()) {
+        std::move(cancel_conversation_load_callback_).Run();
+        cancel_conversation_load_callback_ = base::NullCallback();
+        return;
+    }
+    DVLOG(1) << "Loaded " << conversations.size() << " conversations.";
+    for (auto& conversation : conversations) {
+        std::string uuid = conversation->uuid;
+        DVLOG(2) << "Loaded conversation " << conversation->uuid
+            << " with details: " << "\n has content: "
+            << conversation->has_content
+            << "\n last updated: " << conversation->updated_time
+            << "\n title: " << conversation->title;
+        // It's ok to overwrite existing metadata - some operations may modify
+        // the database data and we want to keep the in-memory data synchronised.
+        auto existing_conversation_it = conversations_.find(uuid);
+        if (existing_conversation_it != conversations_.end()) {
+            auto& existing_conversation = existing_conversation_it->second;
+            existing_conversation->title = conversation->title;
+            existing_conversation->updated_time = conversation->updated_time;
+            existing_conversation->has_content = conversation->has_content;
+            existing_conversation->model_key = conversation->model_key;
+            existing_conversation->associated_content =
+                std::move(conversation->associated_content);
+        }
+        else {
+            conversations_.emplace(uuid, std::move(conversation));
+        }
+        auto handler_it = conversation_handlers_.find(uuid);
+        if (handler_it != conversation_handlers_.end()) {
+            // Notify the handler that metadata is possibly changed
+            ConversationHandler* handler = handler_it->second.get();
+            handler->OnConversationMetadataUpdated();
+            // If a reload was asked for, then we should also update the deeper
+            // conversation data from the database, since the reload was likely due
+            // to underlying data changing.
+            ai_chat_db_.AsyncCall(&AIChatDatabase::GetConversationData)
+                .WithArgs(uuid)
+                .Then(base::BindOnce(
+                    [](base::WeakPtr<ConversationHandler> handler,
+                        mojom::ConversationArchivePtr updated_data) {
+                            if (!handler) {
+                                return;
+                            }
+                            handler->OnArchiveContentUpdated(std::move(updated_data));
+                    },
+                    handler->GetWeakPtr()));
+        }
+    }
+    if (on_conversations_loaded_callbacks_.has_value()) {
+        for (auto& callback : on_conversations_loaded_callbacks_.value()) {
+            std::move(callback).Run(conversations_);
+        }
+        on_conversations_loaded_callbacks_->clear();
+    }
+    OnConversationListChanged();
+}
+
+void AIChatService::ReloadConversations(bool from_cancel) {
+    // If in the middle of a conversation load, then make sure data is ignored,
+    // and ask again when current load is complete.
+    if (!from_cancel && on_conversations_loaded_callbacks_.has_value() &&
+        !on_conversations_loaded_callbacks_->empty()) {
+        cancel_conversation_load_callback_ =
+            base::BindOnce(&AIChatService::ReloadConversations,
+                weak_ptr_factory_.GetWeakPtr(), true);
+        return;
+    }
+
+    // Collect any previous callbacks and force conversations to load again
+    std::vector<ConversationMapCallback> previous_callbacks;
+    if (on_conversations_loaded_callbacks_.has_value()) {
+        on_conversations_loaded_callbacks_->swap(previous_callbacks);
+    }
+    on_conversations_loaded_callbacks_ = std::nullopt;
+    LoadConversationsLazy(base::DoNothing());
+
+    // Re-queue any previous callbacks
+    for (auto& callback : previous_callbacks) {
+        LoadConversationsLazy(std::move(callback));
+    }
+}
+
+void AIChatService::OnConversationDataReceived(
+    std::string conversation_uuid,
+    base::OnceCallback<void(ConversationHandler*)> callback,
+    mojom::ConversationArchivePtr data) {
+    DVLOG(4) << __func__ << " for " << conversation_uuid
+        << " with data: " << data->entries.size() << " entries and "
+        << data->associated_content.size() << " contents";
+    auto conversation_it = conversations_.find(conversation_uuid);
+    if (conversation_it == conversations_.end()) {
+        std::move(callback).Run(nullptr);
+        return;
+    }
+    mojom::Conversation* conversation = conversation_it->second.get();
+    std::unique_ptr<ConversationHandler> conversation_handler =
+        std::make_unique<ConversationHandler>(
+            conversation, this, model_service_, credential_manager_.get(),
+            feedback_api_.get(), url_loader_factory_, std::move(data));
+    conversation_observations_.AddObservation(conversation_handler.get());
+    conversation_handlers_.insert_or_assign(conversation_uuid,
+        std::move(conversation_handler));
+    std::move(callback).Run(GetConversation(conversation_uuid));
+}
+
+void AIChatService::MaybeAssociateContentWithConversation(
+    ConversationHandler* conversation,
+    int associated_content_id,
+    base::WeakPtr<ConversationHandler::AssociatedContentDelegate>
+    associated_content) {
+    if (associated_content &&
+        kAllowedContentSchemes.contains(associated_content->GetURL().scheme())) {
+        conversation->SetAssociatedContentDelegate(associated_content);
+    }
+    // Record that this is the latest conversation for this content. Even
+    // if we don't call SetAssociatedContentDelegate, the conversation still
+    // has a default Tab's navigation for which is is associated. The Conversation
+    // won't use that Tab's Page for context.
+    content_conversations_.insert_or_assign(
+        associated_content_id, conversation->get_conversation_uuid());
+}
+
+void AIChatService::MaybeUnloadConversation(
+    ConversationHandler* conversation_handler) {
+    // Don't unload if there is active UI for the conversation
+    if (conversation_handler->IsAnyClientConnected()) {
+        return;
+    }
+
+    bool has_history = conversation_handler->HasAnyHistory();
+
+    // We can keep a conversation with history in memory until there is no active
+    // content.
+    // TODO(petemill): With the history feature enabled, we should unload (if
+    // there is no request in progress). However, we can only do this when
+    // GetOrCreateConversationHandlerForContent allows a callback so that it
+    // can provide an answer after loading the conversation content from storage.
+    if (conversation_handler->IsAssociatedContentAlive() && has_history) {
+        return;
+    }
+
+    auto uuid = conversation_handler->get_conversation_uuid();
+    conversation_observations_.RemoveObservation(conversation_handler);
+    conversation_handlers_.erase(uuid);
+    DVLOG(1) << "Unloaded conversation (" << uuid << ") from memory. Now have "
+        << conversations_.size() << " Conversation metadata items and "
+        << conversation_handlers_.size()
+        << " ConversationHandler instances.";
+    if (!IsAIChatHistoryEnabled() || !has_history) {
+        // Can erase because no active UI and no history, so it's
+        // not a real / persistable conversation
+        conversations_.erase(uuid);
+        std::erase_if(content_conversations_,
+            [&uuid](const auto& kv) { return kv.second == uuid; });
+        DVLOG(1) << "Erased conversation (" << uuid << "). Now have "
+            << conversations_.size() << " Conversation metadata items and "
+            << conversation_handlers_.size()
+            << " ConversationHandler instances.";
+        OnConversationListChanged();
+    }
+}
+
+void AIChatService::HandleFirstEntry(
+    ConversationHandler* handler,
+    mojom::ConversationTurnPtr& entry,
+    std::optional<std::string_view> associated_content_value,
+    mojom::ConversationPtr& conversation) {
+    DVLOG(1) << __func__ << " Conversation " << conversation->uuid
+        << " being persisted for first time.";
+    CHECK(entry->uuid.has_value());
+    CHECK(conversation->associated_content->uuid.has_value());
+    // We can persist the conversation metadata for the first time as well as the
+    // entry.
+    if (ai_chat_db_) {
+        ai_chat_db_.AsyncCall(base::IgnoreResult(&AIChatDatabase::AddConversation))
+            .WithArgs(conversation->Clone(),
+                std::optional<std::string>(associated_content_value),
+                entry->Clone());
+    }
+    // Record metrics
+    if (ai_chat_metrics_ != nullptr) {
+        if (handler->GetConversationHistory().size() == 1) {
+            ai_chat_metrics_->RecordNewChat();
+            ai_chat_metrics_->RecordNewPrompt();
+        }
+    }
+}
+
+void AIChatService::HandleNewEntry(
+    ConversationHandler* handler,
+    mojom::ConversationTurnPtr& entry,
+    std::optional<std::string_view> associated_content_value,
+    mojom::ConversationPtr& conversation) {
+    CHECK(entry->uuid.has_value());
+    DVLOG(1) << __func__ << " Conversation " << conversation->uuid
+        << " persisting new entry. Count of entries: "
+        << handler->GetConversationHistory().size();
+
+    // Persist the new entry and update the associated content data, if present
+    if (ai_chat_db_) {
+        ai_chat_db_
+            .AsyncCall(base::IgnoreResult(&AIChatDatabase::AddConversationEntry))
+            .WithArgs(handler->get_conversation_uuid(), entry.Clone(),
+                conversation->model_key, std::nullopt);
+
+        if (associated_content_value.has_value() &&
+            conversation->associated_content->is_content_association_possible) {
+            ai_chat_db_
+                .AsyncCall(
+                    base::IgnoreResult(&AIChatDatabase::AddOrUpdateAssociatedContent))
+                .WithArgs(conversation->uuid,
+                    conversation->associated_content->Clone(),
+                    std::optional<std::string>(associated_content_value));
+        }
+    }
+
+    // Record metrics
+    if (ai_chat_metrics_ != nullptr &&
+        entry->character_type == mojom::CharacterType::HUMAN) {
+        ai_chat_metrics_->RecordNewPrompt();
+    }
+}
+
+void AIChatService::OnUserOptedIn() {
+    OnStateChanged();
+    bool is_opted_in = HasUserOptedIn();
+    if (!is_opted_in) {
+        return;
+    }
+    for (auto& kv : conversation_handlers_) {
+        kv.second->OnUserOptedIn();
+    }
+    if (ai_chat_metrics_ != nullptr) {
+        ai_chat_metrics_->RecordEnabled(true, true, {});
+    }
+}
+
+void AIChatService::OnConversationListChanged() {
+    auto conversations = FilterVisibleConversations(conversations_);
+    for (auto& remote : observer_remotes_) {
+        std::vector<mojom::ConversationPtr> client_conversations;
+        for (const auto& conversation : conversations) {
+            client_conversations.push_back(conversation->Clone());
+        }
+        remote->OnConversationListChanged(std::move(client_conversations));
+    }
+}
+
+void AIChatService::OnPremiumStatusReceived(GetPremiumStatusCallback callback,
+    mojom::PremiumStatus status,
+    mojom::PremiumInfoPtr info) {
+#if BUILDFLAG(IS_ANDROID)
+    // There is no UI for android to "refresh" with an iAP - we are likely still
+    // authenticating after first iAP, so we should show as active.
+    if (status == mojom::PremiumStatus::ActiveDisconnected &&
+        profile_prefs_->GetBoolean(prefs::kBraveChatSubscriptionActiveAndroid)) {
+        status = mojom::PremiumStatus::Active;
+    }
+#endif
+
+    last_premium_status_ = status;
+    if (ai_chat_metrics_ != nullptr) {
+        ai_chat_metrics_->OnPremiumStatusUpdated(
+            ai_chat::HasUserOptedIn(profile_prefs_), false, status, info.Clone());
+    }
+    model_service_->OnPremiumStatus(status);
+    std::move(callback).Run(status, std::move(info));
+}
+
 void AIChatService::OnDataDeletedForDisabledStorage(bool success) {
   // Remove any conversations from in-memory that aren't connected to UI.
   // This is done now, in the callback from DeleteAllData, in case there
@@ -437,244 +940,6 @@ void AIChatService::OnDataDeletedForDisabledStorage(bool success) {
   }
 }
 
-void AIChatService::LoadConversationsLazy(ConversationMapCallback callback) {
-  // Send immediately if we have finished loading from storage
-  if (!ai_chat_db_ || (on_conversations_loaded_callbacks_.has_value() &&
-                       on_conversations_loaded_callbacks_->empty())) {
-    std::move(callback).Run(conversations_);
-    return;
-  }
-  if (on_conversations_loaded_callbacks_.has_value()) {
-    on_conversations_loaded_callbacks_->push_back(std::move(callback));
-    return;
-  }
-
-  on_conversations_loaded_callbacks_ = std::vector<ConversationMapCallback>();
-  on_conversations_loaded_callbacks_->push_back(std::move(callback));
-  ai_chat_db_.AsyncCall(&AIChatDatabase::GetAllConversations)
-      .Then(base::BindOnce(&AIChatService::OnLoadConversationsLazyData,
-                           weak_ptr_factory_.GetWeakPtr()));
-}
-
-void AIChatService::OnLoadConversationsLazyData(
-    std::vector<mojom::ConversationPtr> conversations) {
-  if (!cancel_conversation_load_callback_.is_null()) {
-    std::move(cancel_conversation_load_callback_).Run();
-    cancel_conversation_load_callback_ = base::NullCallback();
-    return;
-  }
-  DVLOG(1) << "Loaded " << conversations.size() << " conversations.";
-  for (auto& conversation : conversations) {
-    std::string uuid = conversation->uuid;
-    DVLOG(2) << "Loaded conversation " << conversation->uuid
-             << " with details: " << "\n has content: "
-             << conversation->has_content
-             << "\n last updated: " << conversation->updated_time
-             << "\n title: " << conversation->title;
-    // It's ok to overwrite existing metadata - some operations may modify
-    // the database data and we want to keep the in-memory data synchronised.
-    auto existing_conversation_it = conversations_.find(uuid);
-    if (existing_conversation_it != conversations_.end()) {
-      auto& existing_conversation = existing_conversation_it->second;
-      existing_conversation->title = conversation->title;
-      existing_conversation->updated_time = conversation->updated_time;
-      existing_conversation->has_content = conversation->has_content;
-      existing_conversation->model_key = conversation->model_key;
-      existing_conversation->associated_content =
-          std::move(conversation->associated_content);
-    } else {
-      conversations_.emplace(uuid, std::move(conversation));
-    }
-    auto handler_it = conversation_handlers_.find(uuid);
-    if (handler_it != conversation_handlers_.end()) {
-      // Notify the handler that metadata is possibly changed
-      ConversationHandler* handler = handler_it->second.get();
-      handler->OnConversationMetadataUpdated();
-      // If a reload was asked for, then we should also update the deeper
-      // conversation data from the database, since the reload was likely due
-      // to underlying data changing.
-      ai_chat_db_.AsyncCall(&AIChatDatabase::GetConversationData)
-          .WithArgs(uuid)
-          .Then(base::BindOnce(
-              [](base::WeakPtr<ConversationHandler> handler,
-                 mojom::ConversationArchivePtr updated_data) {
-                if (!handler) {
-                  return;
-                }
-                handler->OnArchiveContentUpdated(std::move(updated_data));
-              },
-              handler->GetWeakPtr()));
-    }
-  }
-  if (on_conversations_loaded_callbacks_.has_value()) {
-    for (auto& callback : on_conversations_loaded_callbacks_.value()) {
-      std::move(callback).Run(conversations_);
-    }
-    on_conversations_loaded_callbacks_->clear();
-  }
-  OnConversationListChanged();
-}
-
-void AIChatService::ReloadConversations(bool from_cancel) {
-  // If in the middle of a conversation load, then make sure data is ignored,
-  // and ask again when current load is complete.
-  if (!from_cancel && on_conversations_loaded_callbacks_.has_value() &&
-      !on_conversations_loaded_callbacks_->empty()) {
-    cancel_conversation_load_callback_ =
-        base::BindOnce(&AIChatService::ReloadConversations,
-                       weak_ptr_factory_.GetWeakPtr(), true);
-    return;
-  }
-
-  // Collect any previous callbacks and force conversations to load again
-  std::vector<ConversationMapCallback> previous_callbacks;
-  if (on_conversations_loaded_callbacks_.has_value()) {
-    on_conversations_loaded_callbacks_->swap(previous_callbacks);
-  }
-  on_conversations_loaded_callbacks_ = std::nullopt;
-  LoadConversationsLazy(base::DoNothing());
-
-  // Re-queue any previous callbacks
-  for (auto& callback : previous_callbacks) {
-    LoadConversationsLazy(std::move(callback));
-  }
-}
-
-void AIChatService::MaybeAssociateContentWithConversation(
-    ConversationHandler* conversation,
-    int associated_content_id,
-    base::WeakPtr<ConversationHandler::AssociatedContentDelegate>
-        associated_content) {
-  if (associated_content &&
-      kAllowedContentSchemes.contains(associated_content->GetURL().scheme())) {
-    conversation->SetAssociatedContentDelegate(associated_content);
-  }
-  // Record that this is the latest conversation for this content. Even
-  // if we don't call SetAssociatedContentDelegate, the conversation still
-  // has a default Tab's navigation for which is is associated. The Conversation
-  // won't use that Tab's Page for context.
-  content_conversations_.insert_or_assign(
-      associated_content_id, conversation->get_conversation_uuid());
-}
-
-void AIChatService::MarkAgreementAccepted() {
-  SetUserOptedIn(profile_prefs_, true);
-}
-
-void AIChatService::EnableStoragePref() {
-  profile_prefs_->SetBoolean(prefs::kBraveChatStorageEnabled, true);
-}
-
-void AIChatService::DismissStorageNotice() {
-  profile_prefs_->SetBoolean(prefs::kUserDismissedStorageNotice, true);
-}
-
-void AIChatService::DismissPremiumPrompt() {
-  profile_prefs_->SetBoolean(prefs::kUserDismissedPremiumPrompt, true);
-}
-
-void AIChatService::GetActionMenuList(GetActionMenuListCallback callback) {
-  std::move(callback).Run(ai_chat::GetActionMenuList());
-}
-
-void AIChatService::GetPremiumStatus(GetPremiumStatusCallback callback) {
-  credential_manager_->GetPremiumStatus(
-      base::BindOnce(&AIChatService::OnPremiumStatusReceived,
-                     weak_ptr_factory_.GetWeakPtr(), std::move(callback)));
-}
-
-void AIChatService::DeleteConversation(const std::string& id) {
-  auto handler_it = conversation_handlers_.find(id);
-  if (handler_it != conversation_handlers_.end()) {
-    conversation_observations_.RemoveObservation(handler_it->second.get());
-    conversation_handlers_.erase(id);
-  }
-  conversations_.erase(id);
-  DVLOG(1) << "Erased conversation due to deletion request (" << id
-           << "). Now have " << conversations_.size()
-           << " Conversation metadata items and "
-           << conversation_handlers_.size()
-           << " ConversationHandler instances.";
-  OnConversationListChanged();
-  // Update database
-  if (ai_chat_db_) {
-    ai_chat_db_
-        .AsyncCall(base::IgnoreResult(&AIChatDatabase::DeleteConversation))
-        .WithArgs(id);
-  }
-}
-
-void AIChatService::RenameConversation(const std::string& id,
-                                       const std::string& new_name) {
-  OnConversationTitleChanged(id, new_name);
-}
-
-void AIChatService::ConversationExists(const std::string& conversation_uuid,
-                                       ConversationExistsCallback callback) {
-  std::move(callback).Run(conversations_.contains(conversation_uuid));
-}
-
-void AIChatService::OnPremiumStatusReceived(GetPremiumStatusCallback callback,
-                                            mojom::PremiumStatus status,
-                                            mojom::PremiumInfoPtr info) {
-#if BUILDFLAG(IS_ANDROID)
-  // There is no UI for android to "refresh" with an iAP - we are likely still
-  // authenticating after first iAP, so we should show as active.
-  if (status == mojom::PremiumStatus::ActiveDisconnected &&
-      profile_prefs_->GetBoolean(prefs::kBraveChatSubscriptionActiveAndroid)) {
-    status = mojom::PremiumStatus::Active;
-  }
-#endif
-
-  last_premium_status_ = status;
-  if (ai_chat_metrics_ != nullptr) {
-    ai_chat_metrics_->OnPremiumStatusUpdated(
-        ai_chat::HasUserOptedIn(profile_prefs_), false, status, info.Clone());
-  }
-  model_service_->OnPremiumStatus(status);
-  std::move(callback).Run(status, std::move(info));
-}
-
-void AIChatService::MaybeUnloadConversation(
-    ConversationHandler* conversation_handler) {
-  // Don't unload if there is active UI for the conversation
-  if (conversation_handler->IsAnyClientConnected()) {
-    return;
-  }
-
-  bool has_history = conversation_handler->HasAnyHistory();
-
-  // We can keep a conversation with history in memory until there is no active
-  // content.
-  // TODO(petemill): With the history feature enabled, we should unload (if
-  // there is no request in progress). However, we can only do this when
-  // GetOrCreateConversationHandlerForContent allows a callback so that it
-  // can provide an answer after loading the conversation content from storage.
-  if (conversation_handler->IsAssociatedContentAlive() && has_history) {
-    return;
-  }
-
-  auto uuid = conversation_handler->get_conversation_uuid();
-  conversation_observations_.RemoveObservation(conversation_handler);
-  conversation_handlers_.erase(uuid);
-  DVLOG(1) << "Unloaded conversation (" << uuid << ") from memory. Now have "
-           << conversations_.size() << " Conversation metadata items and "
-           << conversation_handlers_.size()
-           << " ConversationHandler instances.";
-  if (!IsAIChatHistoryEnabled() || !has_history) {
-    // Can erase because no active UI and no history, so it's
-    // not a real / persistable conversation
-    conversations_.erase(uuid);
-    std::erase_if(content_conversations_,
-                  [&uuid](const auto& kv) { return kv.second == uuid; });
-    DVLOG(1) << "Erased conversation (" << uuid << "). Now have "
-             << conversations_.size() << " Conversation metadata items and "
-             << conversation_handlers_.size()
-             << " ConversationHandler instances.";
-    OnConversationListChanged();
-  }
-}
-
 mojom::ServiceStatePtr AIChatService::BuildState() {
   bool has_user_dismissed_storage_notice =
       profile_prefs_->GetBoolean(prefs::kUserDismissedStorageNotice);
@@ -702,272 +967,9 @@ mojom::ServiceStatePtr AIChatService::BuildState() {
 }
 
 void AIChatService::OnStateChanged() {
-  mojom::ServiceStatePtr state = BuildState();
-  for (auto& remote : observer_remotes_) {
-    remote->OnStateChanged(state.Clone());
-  }
-}
-
-bool AIChatService::IsAIChatHistoryEnabled() {
-  return (features::IsAIChatHistoryEnabled() &&
-          profile_prefs_->GetBoolean(prefs::kBraveChatStorageEnabled));
-}
-
-void AIChatService::OnRequestInProgressChanged(ConversationHandler* handler,
-                                               bool in_progress) {
-  // We don't unload a conversation if it has a request in progress, so check
-  // again when that changes.
-  if (!in_progress) {
-    MaybeUnloadConversation(handler);
-  }
-}
-
-void AIChatService::OnConversationEntryAdded(
-    ConversationHandler* handler,
-    mojom::ConversationTurnPtr& entry,
-    std::optional<std::string_view> associated_content_value) {
-  auto conversation_it = conversations_.find(handler->get_conversation_uuid());
-  CHECK(conversation_it != conversations_.end());
-  mojom::ConversationPtr& conversation = conversation_it->second;
-
-  if (!conversation->has_content) {
-    HandleFirstEntry(handler, entry, associated_content_value, conversation);
-  } else {
-    HandleNewEntry(handler, entry, associated_content_value, conversation);
-  }
-
-  conversation->has_content = true;
-  conversation->updated_time = entry->created_time;
-  OnConversationListChanged();
-}
-
-void AIChatService::HandleFirstEntry(
-    ConversationHandler* handler,
-    mojom::ConversationTurnPtr& entry,
-    std::optional<std::string_view> associated_content_value,
-    mojom::ConversationPtr& conversation) {
-  DVLOG(1) << __func__ << " Conversation " << conversation->uuid
-           << " being persisted for first time.";
-  CHECK(entry->uuid.has_value());
-  CHECK(conversation->associated_content->uuid.has_value());
-  // We can persist the conversation metadata for the first time as well as the
-  // entry.
-  if (ai_chat_db_) {
-    ai_chat_db_.AsyncCall(base::IgnoreResult(&AIChatDatabase::AddConversation))
-        .WithArgs(conversation->Clone(),
-                  std::optional<std::string>(associated_content_value),
-                  entry->Clone());
-  }
-  // Record metrics
-  if (ai_chat_metrics_ != nullptr) {
-    if (handler->GetConversationHistory().size() == 1) {
-      ai_chat_metrics_->RecordNewChat();
-      ai_chat_metrics_->RecordNewPrompt();
+    mojom::ServiceStatePtr state = BuildState();
+    for (auto& remote : observer_remotes_) {
+        remote->OnStateChanged(state.Clone());
     }
-  }
-}
-
-void AIChatService::HandleNewEntry(
-    ConversationHandler* handler,
-    mojom::ConversationTurnPtr& entry,
-    std::optional<std::string_view> associated_content_value,
-    mojom::ConversationPtr& conversation) {
-  CHECK(entry->uuid.has_value());
-  DVLOG(1) << __func__ << " Conversation " << conversation->uuid
-           << " persisting new entry. Count of entries: "
-           << handler->GetConversationHistory().size();
-
-  // Persist the new entry and update the associated content data, if present
-  if (ai_chat_db_) {
-    ai_chat_db_
-        .AsyncCall(base::IgnoreResult(&AIChatDatabase::AddConversationEntry))
-        .WithArgs(handler->get_conversation_uuid(), entry.Clone(),
-                  conversation->model_key, std::nullopt);
-
-    if (associated_content_value.has_value() &&
-        conversation->associated_content->is_content_association_possible) {
-      ai_chat_db_
-          .AsyncCall(
-              base::IgnoreResult(&AIChatDatabase::AddOrUpdateAssociatedContent))
-          .WithArgs(conversation->uuid,
-                    conversation->associated_content->Clone(),
-                    std::optional<std::string>(associated_content_value));
-    }
-  }
-
-  // Record metrics
-  if (ai_chat_metrics_ != nullptr &&
-      entry->character_type == mojom::CharacterType::HUMAN) {
-    ai_chat_metrics_->RecordNewPrompt();
-  }
-}
-
-void AIChatService::OnConversationEntryRemoved(ConversationHandler* handler,
-                                               std::string entry_uuid) {
-  // Persist the removal
-  if (ai_chat_db_) {
-    ai_chat_db_
-        .AsyncCall(base::IgnoreResult(&AIChatDatabase::DeleteConversationEntry))
-        .WithArgs(entry_uuid);
-  }
-}
-
-void AIChatService::OnClientConnectionChanged(ConversationHandler* handler) {
-  DVLOG(4) << "Client connection changed for conversation "
-           << handler->get_conversation_uuid();
-  MaybeUnloadConversation(handler);
-}
-
-void AIChatService::OnConversationTitleChanged(
-    const std::string& conversation_uuid,
-    const std::string& new_title) {
-  auto conversation_it = conversations_.find(conversation_uuid);
-  if (conversation_it == conversations_.end()) {
-    DLOG(ERROR) << "Conversation not found for title change";
-    return;
-  }
-
-  auto& conversation_metadata = conversation_it->second;
-  conversation_metadata->title = new_title;
-
-  OnConversationListChanged();
-
-  // Persist the change
-  if (ai_chat_db_) {
-    ai_chat_db_
-        .AsyncCall(base::IgnoreResult(&AIChatDatabase::UpdateConversationTitle))
-        .WithArgs(conversation_uuid, new_title);
-  }
-}
-
-void AIChatService::OnAssociatedContentDestroyed(ConversationHandler* handler,
-                                                 int content_id) {
-  content_conversations_.erase(content_id);
-  MaybeUnloadConversation(handler);
-}
-
-void AIChatService::GetVisibleConversations(
-    GetVisibleConversationsCallback callback) {
-  LoadConversationsLazy(base::BindOnce(
-      [](GetVisibleConversationsCallback callback,
-         ConversationMap& conversations_map) {
-        std::vector<mojom::ConversationPtr> conversations;
-        for (const auto& conversation :
-             FilterVisibleConversations(conversations_map)) {
-          conversations.push_back(conversation->Clone());
-        }
-        std::move(callback).Run(std::move(conversations));
-      },
-      std::move(callback)));
-}
-
-void AIChatService::BindConversation(
-    const std::string& uuid,
-    mojo::PendingReceiver<mojom::ConversationHandler> receiver,
-    mojo::PendingRemote<mojom::ConversationUI> conversation_ui_handler) {
-  GetConversation(
-      std::move(uuid),
-      base::BindOnce(
-          [](mojo::PendingReceiver<mojom::ConversationHandler> receiver,
-             mojo::PendingRemote<mojom::ConversationUI> conversation_ui_handler,
-             ConversationHandler* handler) {
-            if (!handler) {
-              DVLOG(0) << "Failed to get conversation for binding";
-              return;
-            }
-            handler->Bind(std::move(receiver),
-                          std::move(conversation_ui_handler));
-          },
-          std::move(receiver), std::move(conversation_ui_handler)));
-}
-
-void AIChatService::BindObserver(
-    mojo::PendingRemote<mojom::ServiceObserver> observer,
-    BindObserverCallback callback) {
-  observer_remotes_.Add(std::move(observer));
-  std::move(callback).Run(BuildState());
-}
-
-bool AIChatService::HasUserOptedIn() {
-  return ai_chat::HasUserOptedIn(profile_prefs_);
-}
-
-bool AIChatService::IsPremiumStatus() {
-  return ai_chat::IsPremiumStatus(last_premium_status_);
-}
-
-std::unique_ptr<EngineConsumer> AIChatService::GetDefaultAIEngine() {
-  return model_service_->GetEngineForModel(model_service_->GetDefaultModelKey(),
-                                           url_loader_factory_,
-                                           credential_manager_.get());
-}
-
-size_t AIChatService::GetInMemoryConversationCountForTesting() {
-  return conversation_handlers_.size();
-}
-
-void AIChatService::OnUserOptedIn() {
-  OnStateChanged();
-  bool is_opted_in = HasUserOptedIn();
-  if (!is_opted_in) {
-    return;
-  }
-  for (auto& kv : conversation_handlers_) {
-    kv.second->OnUserOptedIn();
-  }
-  if (ai_chat_metrics_ != nullptr) {
-    ai_chat_metrics_->RecordEnabled(true, true, {});
-  }
-}
-
-void AIChatService::OnConversationListChanged() {
-  auto conversations = FilterVisibleConversations(conversations_);
-  for (auto& remote : observer_remotes_) {
-    std::vector<mojom::ConversationPtr> client_conversations;
-    for (const auto& conversation : conversations) {
-      client_conversations.push_back(conversation->Clone());
-    }
-    remote->OnConversationListChanged(std::move(client_conversations));
-  }
-}
-
-void AIChatService::OpenConversationWithStagedEntries(
-    base::WeakPtr<ConversationHandler::AssociatedContentDelegate>
-        associated_content,
-    base::OnceClosure open_ai_chat) {
-  if (!associated_content || !associated_content->HasOpenAIChatPermission()) {
-    return;
-  }
-
-  ConversationHandler* conversation = GetOrCreateConversationHandlerForContent(
-      associated_content->GetContentId(), associated_content);
-  CHECK(conversation);
-
-#if !BUILDFLAG(IS_ANDROID) && !BUILDFLAG(IS_IOS)
-  if (ai_chat_metrics_ != nullptr) {
-    ai_chat_metrics_->HandleOpenViaEntryPoint(EntryPoint::kBraveSearch);
-  }
-#endif
-  // Open AI Chat and trigger a fetch of staged conversations from Brave Search.
-  std::move(open_ai_chat).Run();
-  conversation->MaybeFetchOrClearContentStagedConversation();
-}
-
-void AIChatService::AssociateContent(
-    ConversationHandler::AssociatedContentDelegate* content,
-    const std::string& conversation_uuid) {
-  CHECK(content);
-
-  // Note: As we're using the non-async version of GetConversation, this will
-  // only work when the conversation is already loaded.
-  // If we ever need to associate content with a conversation that is not
-  // loaded, we'll need to use the async version of GetConversation.
-  auto* conversation = GetConversation(conversation_uuid);
-  if (!conversation) {
-    return;
-  }
-
-  MaybeAssociateContentWithConversation(conversation, content->GetContentId(),
-                                        content->GetWeakPtr());
 }
 }  // namespace ai_chat
